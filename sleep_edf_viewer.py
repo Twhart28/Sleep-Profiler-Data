@@ -285,16 +285,15 @@ class ChannelPlot:
             anchor="center",
             padding=(2, 6),
         )
-        self.value_label.grid(row=1, column=0, sticky="ew", pady=(4, 8))
+        self.value_label.grid(row=1, column=0, sticky="ew", pady=(2, 4))
 
         button_frame = ttk.Frame(self.control_frame)
         button_frame.grid(row=2, column=0, sticky="n")
-        ttk.Button(button_frame, text="+", width=3, command=self._scale_up).grid(row=0, column=0, pady=(0, 4))
-        ttk.Button(button_frame, text="Auto", width=5, command=self._autoscale).grid(row=1, column=0, pady=4)
-        ttk.Button(button_frame, text="-", width=3, command=self._scale_down).grid(row=2, column=0, pady=(4, 0))
+        ttk.Button(button_frame, text="+", width=1, command=self._scale_up).grid(row=0, column=2, pady=(0, 0))
+        ttk.Button(button_frame, text="A", width=2, command=self._autoscale).grid(row=0, column=1, pady=0)
+        ttk.Button(button_frame, text="-", width=1, command=self._scale_down).grid(row=0, column=0, pady=(0, 0))
 
         self.scale_label = ttk.Label(self.control_frame, text="", anchor="center")
-        self.scale_label.grid(row=3, column=0, sticky="ew", pady=(8, 0))
 
         self.figure = Figure(figsize=(7, 1.8))
         self.figure.subplots_adjust(left=0.08, right=0.98, top=0.92, bottom=0.2)
@@ -410,13 +409,32 @@ class ChannelPlot:
             renderer = self.canvas.get_renderer()
         if renderer is None:
             return
-        axis_bbox = self.ax.get_window_extent(renderer=renderer)
-        height_px = axis_bbox.height
         ticks = list(self.ax.get_yticks())
         if not ticks:
             return
-        approx_label_height = 14  # pixels
-        if len(ticks) > 1 and height_px <= approx_label_height * (len(ticks) + 0.5):
+
+        tick_points = np.column_stack((np.zeros(len(ticks)), ticks))
+        tick_pixels = np.sort(self.ax.transData.transform(tick_points)[:, 1])
+
+        label_heights: List[float] = []
+        major_ticks = self.ax.yaxis.get_major_ticks()[: len(ticks)]
+        for tick in major_ticks:
+            label = tick.label1
+            if not label.get_text():
+                label.set_text(self.ax.yaxis.get_major_formatter().format_data_short(tick.loc))
+            bbox = label.get_window_extent(renderer=renderer)
+            if bbox.height == 0:
+                continue
+            label_heights.append(bbox.height)
+
+        approx_label_height = max(label_heights, default=14.0)
+
+        overlaps = any(
+            abs(b - a) < approx_label_height * 0.9
+            for a, b in zip(tick_pixels, tick_pixels[1:])
+        )
+
+        if overlaps:
             center = (limits[0] + limits[1]) / 2.0
             self.ax.set_yticks([center])
         else:
@@ -535,14 +553,14 @@ class EDFViewer(tk.Tk):
         self.paned = tk.PanedWindow(
             plot_frame,
             orient=tk.VERTICAL,
-            sashrelief=tk.SOLID,
-            sashwidth=12,
-            sashpad=4,
-            bg="#111111",
+            sashrelief=tk.FLAT,
+            sashwidth=2,
+            sashpad=1,
+            bg="#000000",
             bd=0,
             showhandle=True,
-            handlepad=18,
-            handlesize=30,
+            handlepad=1,
+            handlesize=2,
             sashcursor="sb_v_double_arrow",
         )
         self.paned.grid(row=0, column=0, sticky="nsew")
