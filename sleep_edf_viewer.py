@@ -9,9 +9,10 @@ from __future__ import annotations
 import sys
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Callable
 
 import itertools
+import math
 
 try:
     import pyedflib  # type: ignore
@@ -32,7 +33,42 @@ matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.backend_bases import MouseEvent
 from matplotlib.figure import Figure
-from matplotlib.axes import Axes
+from matplotlib.ticker import FuncFormatter
+
+
+def _format_seconds_hms(seconds: float) -> str:
+    """Return a HH:MM:SS string for the provided number of seconds."""
+
+    if not math.isfinite(seconds):
+        return "--:--:--"
+    seconds = max(0.0, seconds)
+    total_seconds = int(seconds)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def _format_seconds_hms_ms(seconds: float) -> str:
+    """Return HH:MM:SS.mmm format for display in hover widgets."""
+
+    if not math.isfinite(seconds):
+        return "--:--:--.---"
+    seconds = max(0.0, seconds)
+    total_seconds = int(seconds)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    millis = int(round((seconds - total_seconds) * 1000))
+    # When rounding pushes millis to 1000 roll the values forward.
+    if millis >= 1000:
+        millis -= 1000
+        secs += 1
+        if secs >= 60:
+            secs -= 60
+            minutes += 1
+            if minutes >= 60:
+                minutes -= 60
+                hours += 1
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millis:03d}"
 
 
 class EDFFile:
@@ -68,6 +104,242 @@ class EDFFile:
         return self._signal_cache[label], self.sample_frequency[label]
 
 
+class TimeNavigator(tk.Canvas):
+    """Canvas-based slider that visualises the current time window."""
+
+    def __init__(self, master: tk.Widget, command: Callable[[float], None]) -> None:
+        super().__init__(master, height=36, highlightthickness=0)
+        self._command = command
+        self.total_duration = 1.0
+        self.window_duration = 1.0
+        self.start_seconds = 0.0
+        self._dragging = False
+        self._drag_offset = 0.0
+
+        self.bind("<Configure>", lambda _event: self._redraw())
+        self.bind("<Button-1>", self._on_press)
+        self.bind("<B1-Motion>", self._on_drag)
+        self.bind("<ButtonRelease-1>", self._on_release)
+
+    # ------------------------------------------------------------------
+    def set_state(
+        self,
+        total_duration: float,
+        window_duration: float,
+        start_seconds: float,
+    ) -> None:
+        self.total_duration = max(total_duration, 1e-6)
+        self.window_duration = max(min(window_duration, self.total_duration), 1e-3)
+        max_start = max(0.0, self.total_duration - self.window_duration)
+        self.start_seconds = min(max(start_seconds, 0.0), max_start)
+        self._redraw()
+
+    # ------------------------------------------------------------------
+    def _on_press(self, event: tk.Event) -> None:
+        track_width = max(self.winfo_width() - 12, 1)
+        start_px = 6 + (self.start_seconds / self.total_duration) * track_width
+        window_px = max(track_width * (self.window_duration / self.total_duration), 4)
+        window_px = min(window_px, track_width)
+        if start_px + window_px > 6 + track_width:
+            start_px = 6 + track_width - window_px
+        if start_px <= event.x <= start_px + window_px:
+            self._dragging = True
+            self._drag_offset = event.x - start_px
+        else:
+            self._dragging = True
+            self._drag_offset = window_px / 2
+            self._update_start_from_x(event.x)
+
+    def _on_drag(self, event: tk.Event) -> None:
+        if not self._dragging:
+            return
+        self._update_start_from_x(event.x, self._drag_offset)
+
+    def _on_release(self, _event: tk.Event) -> None:
+        self._dragging = False
+
+    def _update_start_from_x(self, x: float, offset: float | None = None) -> None:
+        track_width = max(self.winfo_width() - 12, 1)
+        window_px = max(track_width * (self.window_duration / self.total_duration), 4)
+        window_px = min(window_px, track_width)
+        if offset is None:
+            offset = window_px / 2
+        left_limit = 6
+        right_limit = left_limit + track_width - window_px
+        new_start_px = min(max(x - offset, left_limit), right_limit)
+        fraction = 0.0 if track_width <= window_px else (new_start_px - left_limit) / (track_width - window_px)
+        max_start = max(0.0, self.total_duration - self.window_duration)
+        new_start = fraction * max_start
+        if abs(new_start - self.start_seconds) > 1e-6:
+            self.start_seconds = new_start
+            self._redraw()
+            if self._command is not None:
+                self._command(self.start_seconds)
+
+    # ------------------------------------------------------------------
+    def _redraw(self) -> None:
+        self.delete("all")
+        width = max(self.winfo_width(), 1)
+        height = max(self.winfo_height(), 1)
+        margin = 6
+        track_left = margin
+        track_right = width - margin
+        track_top = margin
+        track_bottom = height - margin
+        if track_right <= track_left:
+            track_right = track_left + 1
+        self.create_rounded_rect(track_left, track_top, track_right, track_bottom, radius=8, fill="#d6e3f3", outline="")
+        track_width = track_right - track_left
+        window_px = max(track_width * (self.window_duration / self.total_duration), 6)
+        window_px = min(window_px, track_width)
+        max_start_px = track_right - window_px
+        start_px = track_left + (self.start_seconds / self.total_duration) * track_width
+        if start_px + window_px > track_right:
+            start_px = max_start_px
+        start_px = max(track_left, min(start_px, max_start_px))
+        end_px = start_px + window_px
+        self.create_rounded_rect(start_px, track_top, end_px, track_bottom, radius=8, fill="#5b8def", outline="")
+        end_time = min(self.start_seconds + self.window_duration, self.total_duration)
+        text = f"{_format_seconds_hms(self.start_seconds)} – {_format_seconds_hms(end_time)}"
+        self.create_text(
+            width / 2,
+            height / 2,
+            text=text,
+            fill="#1f3b66",
+            font=("TkDefaultFont", 10, "bold"),
+        )
+
+    # ------------------------------------------------------------------
+    def create_rounded_rect(
+        self,
+        x1: float,
+        y1: float,
+        x2: float,
+        y2: float,
+        radius: float = 10,
+        **kwargs: object,
+    ) -> None:
+        """Draw a rounded rectangle on the canvas."""
+
+        radius = min(radius, abs(x2 - x1) / 2, abs(y2 - y1) / 2)
+        points = [
+            x1 + radius,
+            y1,
+            x2 - radius,
+            y1,
+            x2,
+            y1,
+            x2,
+            y1 + radius,
+            x2,
+            y2 - radius,
+            x2,
+            y2,
+            x2 - radius,
+            y2,
+            x1 + radius,
+            y2,
+            x1,
+            y2,
+            x1,
+            y2 - radius,
+            x1,
+            y1 + radius,
+            x1,
+            y1,
+        ]
+        self.create_polygon(points, smooth=True, **kwargs)
+
+
+class ChannelPlot:
+    """Represent a single channel plot within the viewer."""
+
+    def __init__(self, viewer: "EDFViewer", label: str, color: str) -> None:
+        self.viewer = viewer
+        self.label = label
+        self.color = color
+
+        self.frame = ttk.Frame(viewer.paned)
+        self.frame.columnconfigure(0, weight=1)
+        self.frame.rowconfigure(0, weight=1)
+
+        self.figure = Figure(figsize=(7, 1.8))
+        self.ax = self.figure.add_subplot(111)
+        self.ax.set_facecolor("#ffffff")
+        self.ax.grid(True, which="major", linestyle=":", linewidth=0.3, alpha=0.5)
+        self.ax.xaxis.set_major_formatter(FuncFormatter(lambda val, _pos: _format_seconds_hms(val)))
+        self.ax.set_ylabel(label, rotation=0, labelpad=40, fontsize=9, va="center")
+        self.line, = self.ax.plot([], [], color=color, linewidth=0.8)
+        self.ax.axhline(0, color="0.6", linewidth=0.5, linestyle="--", alpha=0.7)
+
+        self.canvas = FigureCanvasTkAgg(self.figure, master=self.frame)
+        self.canvas.draw()
+        self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+
+        controls = ttk.Frame(self.frame)
+        controls.grid(row=1, column=0, sticky="ew")
+        controls.columnconfigure(1, weight=1)
+
+        ttk.Button(controls, text="-", width=3, command=self._scale_down).grid(row=0, column=0, padx=(0, 4))
+        self.scale_label = ttk.Label(controls, text="")
+        self.scale_label.grid(row=0, column=1, sticky="w")
+        ttk.Button(controls, text="Auto", width=5, command=self._autoscale).grid(row=0, column=2, padx=4)
+        ttk.Button(controls, text="+", width=3, command=self._scale_up).grid(row=0, column=3)
+
+        self._hover_cid = self.canvas.mpl_connect("motion_notify_event", self._on_mouse_move)
+
+    # ------------------------------------------------------------------
+    def destroy(self) -> None:
+        if self._hover_cid is not None:
+            self.canvas.mpl_disconnect(self._hover_cid)
+            self._hover_cid = None
+        self.canvas.get_tk_widget().destroy()
+        self.frame.destroy()
+
+    # ------------------------------------------------------------------
+    def update_data(
+        self,
+        time_axis: np.ndarray,
+        values: np.ndarray,
+        limits: Tuple[float, float],
+        window_seconds: float,
+        show_xlabel: bool,
+    ) -> None:
+        self.line.set_data(time_axis, values)
+        if time_axis.size:
+            self.ax.set_xlim(time_axis[0], time_axis[-1])
+        else:
+            start = self.viewer.start_time.get()
+            self.ax.set_xlim(start, start + window_seconds)
+        self.ax.set_ylim(limits)
+        if show_xlabel:
+            self.ax.set_xlabel("Time (HH:MM:SS)")
+            self.ax.tick_params(axis="x", which="both", labelbottom=True)
+        else:
+            self.ax.set_xlabel("")
+            self.ax.tick_params(axis="x", which="both", labelbottom=False)
+        self.scale_label.configure(text=self.viewer._format_scale_text(limits))
+        self.canvas.draw_idle()
+
+    def refresh_formatter(self) -> None:
+        self.ax.xaxis.set_major_formatter(FuncFormatter(lambda val, _pos: _format_seconds_hms(val)))
+
+    # ------------------------------------------------------------------
+    def _scale_up(self) -> None:
+        self.viewer.adjust_manual_scale(self.label, factor=1.25)
+
+    def _scale_down(self) -> None:
+        self.viewer.adjust_manual_scale(self.label, factor=0.8)
+
+    def _autoscale(self) -> None:
+        self.viewer.set_channel_autoscale(self.label, True)
+
+    def _on_mouse_move(self, event: MouseEvent) -> None:
+        if event.xdata is None or event.ydata is None:
+            self.viewer.hover_label.set("")
+            return
+        self.viewer.update_hover(self.label, float(event.xdata), float(event.ydata))
+
 class EDFViewer(tk.Tk):
     """Main application window for browsing EDF channels."""
 
@@ -83,13 +355,19 @@ class EDFViewer(tk.Tk):
 
         self.selected_channels: List[str] = list(edf_file.signal_labels)
         self.channel_scales: Dict[str, tk.DoubleVar] = {}
+        self.channel_autoscale_override: Dict[str, bool] = {}
         for label in edf_file.signal_labels:
             scale_value = self._estimate_initial_scale(label)
             self.channel_scales[label] = tk.DoubleVar(value=scale_value)
+            self.channel_autoscale_override[label] = True
 
-        self.active_axes: List[Axes] = []
         self.hover_label = tk.StringVar(value="")
         self.channel_dialog: ChannelOptionsDialog | None = None
+        self.channel_plots: Dict[str, ChannelPlot] = {}
+        self.channel_colors: Dict[str, str] = {}
+        self._color_cycle = itertools.cycle(
+            matplotlib.rcParams["axes.prop_cycle"].by_key().get("color", ["tab:blue"])
+        )
 
         self._build_layout()
         self._update_plot()
@@ -135,32 +413,12 @@ class EDFViewer(tk.Tk):
         custom_entry.bind("<Return>", lambda _event: self._update_plot())
         custom_entry.bind("<FocusOut>", lambda _event: self._update_plot())
 
-        ttk.Label(sidebar, text="Navigation", font=("TkDefaultFont", 11, "bold")).grid(
+        ttk.Label(sidebar, text="Channels", font=("TkDefaultFont", 11, "bold")).grid(
             row=2, column=0, sticky="w", pady=(16, 0)
         )
 
-        nav_frame = ttk.Frame(sidebar)
-        nav_frame.grid(row=3, column=0, sticky="ew", pady=(8, 0))
-        nav_frame.columnconfigure(0, weight=1)
-
-        self.time_scale = ttk.Scale(
-            nav_frame,
-            from_=0.0,
-            to=self.edf_file.duration_seconds,
-            variable=self.start_time,
-            command=self._on_time_change,
-        )
-        self.time_scale.grid(row=0, column=0, sticky="ew")
-
-        self.time_label = ttk.Label(nav_frame, text="Start: 0.0 s")
-        self.time_label.grid(row=1, column=0, sticky="w", pady=(4, 0))
-
-        ttk.Label(sidebar, text="Channels", font=("TkDefaultFont", 11, "bold")).grid(
-            row=4, column=0, sticky="w", pady=(16, 0)
-        )
-
         channel_controls = ttk.Frame(sidebar)
-        channel_controls.grid(row=5, column=0, sticky="ew", pady=(8, 0))
+        channel_controls.grid(row=3, column=0, sticky="ew", pady=(8, 0))
         channel_controls.columnconfigure(0, weight=1)
 
         ttk.Button(
@@ -179,29 +437,34 @@ class EDFViewer(tk.Tk):
         info = ttk.Label(
             sidebar,
             text=(
-                f"Duration: {self.edf_file.duration_seconds:.1f} s\n"
+                f"Duration: {_format_seconds_hms(self.edf_file.duration_seconds)}\n"
                 f"Channels: {len(self.edf_file.signal_labels)}"
             ),
             justify="left",
         )
-        info.grid(row=6, column=0, sticky="w", pady=(16, 0))
+        info.grid(row=4, column=0, sticky="w", pady=(16, 0))
 
         # Plotting area
-        plot_frame = ttk.Frame(self, padding=10)
+        plot_frame = ttk.Frame(self, padding=(10, 10, 10, 4))
         plot_frame.grid(row=0, column=1, sticky="nsew")
         plot_frame.rowconfigure(0, weight=1)
         plot_frame.columnconfigure(0, weight=1)
 
-        self.figure = Figure(figsize=(9, 6), constrained_layout=True)
-        self.figure.patch.set_facecolor("#f7f9fc")
-        self.canvas = FigureCanvasTkAgg(self.figure, master=plot_frame)
-        self.canvas.draw()
-        self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        self.paned = ttk.Panedwindow(plot_frame, orient=tk.VERTICAL)
+        self.paned.grid(row=0, column=0, sticky="nsew")
 
-        status = ttk.Label(plot_frame, textvariable=self.hover_label, anchor="w")
-        status.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        nav_frame = ttk.Frame(plot_frame, padding=(0, 8, 0, 0))
+        nav_frame.grid(row=1, column=0, sticky="ew")
+        nav_frame.columnconfigure(0, weight=1)
 
-        self.canvas.mpl_connect("motion_notify_event", self._on_mouse_move)
+        self.navigator = TimeNavigator(nav_frame, command=self._on_navigator_change)
+        self.navigator.grid(row=0, column=0, sticky="ew")
+
+        self.time_label = ttk.Label(nav_frame, text="Start: 00:00:00", anchor="w")
+        self.time_label.grid(row=1, column=0, sticky="w", pady=(6, 0))
+
+        status = ttk.Label(nav_frame, textvariable=self.hover_label, anchor="w")
+        status.grid(row=2, column=0, sticky="ew", pady=(4, 0))
 
     # ------------------------------------------------------------------
     # Event handlers
@@ -213,14 +476,17 @@ class EDFViewer(tk.Tk):
         self.window_duration.set(seconds)
         self._update_plot()
 
-    def _on_time_change(self, _value: str) -> None:
-        self.time_label.configure(text=f"Start: {self.start_time.get():.1f} s")
+    def _on_navigator_change(self, start_seconds: float) -> None:
+        self.start_time.set(start_seconds)
         self._update_plot()
 
     def _on_autoscale_toggle(self) -> None:
+        new_state = self.autoscale.get()
+        for label in self.edf_file.signal_labels:
+            self.channel_autoscale_override[label] = new_state
         self._update_plot()
         if self.channel_dialog is not None and tk.Toplevel.winfo_exists(self.channel_dialog):
-            self.channel_dialog.update_scale_state(self.autoscale.get())
+            self.channel_dialog.update_scale_state()
 
     def _open_channel_options(self) -> None:
         if self.channel_dialog is not None and tk.Toplevel.winfo_exists(self.channel_dialog):
@@ -231,100 +497,83 @@ class EDFViewer(tk.Tk):
     # ------------------------------------------------------------------
     # Plotting helpers
     def _update_plot(self) -> None:
-        if not self.selected_channels:
-            self.figure.clear()
-            self.hover_label.set("No channels selected.")
-            self.canvas.draw_idle()
-            return
-
         try:
             window_seconds = float(self.window_duration.get())
         except (tk.TclError, ValueError):
             window_seconds = 0.5
-        window_seconds = max(0.5, window_seconds)
+        window_seconds = max(0.5, min(window_seconds, self.edf_file.duration_seconds))
         self.window_duration.set(window_seconds)
         self.window_preset.set(self._match_preset(window_seconds))
 
-        self._update_time_slider_limits(window_seconds)
-
+        total_duration = self.edf_file.duration_seconds
+        max_start = max(0.0, total_duration - window_seconds)
         start_seconds = float(self.start_time.get())
-        max_start = max(0.0, self.edf_file.duration_seconds - window_seconds)
         start_seconds = min(max(start_seconds, 0.0), max_start)
         self.start_time.set(start_seconds)
-        self.time_label.configure(text=f"Start: {start_seconds:.2f} s")
+        self.time_label.configure(text=f"Start: {_format_seconds_hms(start_seconds)}")
+        self.navigator.set_state(total_duration, window_seconds, start_seconds)
 
-        colors = itertools.cycle(
-            matplotlib.rcParams["axes.prop_cycle"].by_key().get("color", ["tab:blue"])
-        )
+        if not self.selected_channels:
+            self.hover_label.set("No channels selected.")
+            self._clear_channel_plots()
+            return
 
-        self.figure.clear()
-        axes = self.figure.subplots(len(self.selected_channels), 1, sharex=True)
-        if isinstance(axes, Axes):
-            axes_list: List[Axes] = [axes]
-        else:
-            axes_list = list(np.atleast_1d(axes))
+        self.hover_label.set("")
+        self._sync_channel_plots()
 
-        self.active_axes = axes_list
-
-        for ax, label, color in zip(axes_list, self.selected_channels, colors):
-            ax.set_ylabel(label, rotation=0, labelpad=40, fontsize=9, va="center")
+        for index, label in enumerate(self.selected_channels):
             try:
                 signal, sample_rate = self.edf_file.get_signal(label)
             except KeyError:
-                ax.text(
-                    0.5,
-                    0.5,
-                    "Channel unavailable",
-                    transform=ax.transAxes,
-                    ha="center",
-                    va="center",
-                    fontsize=9,
-                    color="red",
-                )
                 continue
 
             total_samples = len(signal)
-            start_index = max(0, int(start_seconds * sample_rate))
-            if total_samples:
-                start_index = min(start_index, total_samples - 1)
-            end_index = int((start_seconds + window_seconds) * sample_rate)
-            end_index = max(start_index + 1, end_index)
-            end_index = min(total_samples, end_index)
-
-            indices = np.arange(start_index, end_index)
-            if indices.size == 0:
-                indices = np.array([start_index])
-                segment = np.array([0.0])
+            if sample_rate <= 0 or total_samples == 0:
+                time_axis = np.array([start_seconds, start_seconds + window_seconds])
+                segment = np.zeros_like(time_axis)
             else:
+                start_index = int(start_seconds * sample_rate)
+                start_index = min(max(start_index, 0), max(total_samples - 1, 0))
+                end_index = int((start_seconds + window_seconds) * sample_rate)
+                end_index = max(start_index + 1, end_index)
+                end_index = min(total_samples, end_index)
+                indices = np.arange(start_index, end_index)
                 segment = signal[start_index:end_index]
-            if sample_rate > 0:
-                time_axis = indices / sample_rate
+                time_axis = indices / sample_rate if indices.size else np.array([start_seconds])
+
+            limits = self._determine_scale(label, segment)
+            plot = self.channel_plots[label]
+            plot.refresh_formatter()
+            show_xlabel = index == len(self.selected_channels) - 1
+            plot.update_data(time_axis, segment, limits, window_seconds, show_xlabel)
+
+    def _sync_channel_plots(self) -> None:
+        for label in list(self.channel_plots.keys()):
+            if label not in self.selected_channels:
+                plot = self.channel_plots.pop(label)
+                self.paned.forget(plot.frame)
+                plot.destroy()
+
+        for label in self.selected_channels:
+            if label not in self.channel_plots:
+                color = self.channel_colors.get(label)
+                if color is None:
+                    color = next(self._color_cycle)
+                    self.channel_colors[label] = color
+                plot = ChannelPlot(self, label, color)
+                self.channel_plots[label] = plot
+                self.paned.add(plot.frame, weight=1)
+                self.channel_autoscale_override.setdefault(label, self.autoscale.get())
             else:
-                time_axis = np.linspace(start_seconds, start_seconds + window_seconds, indices.size)
+                frame = self.channel_plots[label].frame
+                if str(frame) not in self.paned.panes():
+                    self.paned.add(frame, weight=1)
 
-            ax.plot(time_axis, segment, color=color, linewidth=0.8)
-            ax.axhline(0, color="0.6", linewidth=0.5, linestyle="--", alpha=0.7)
-            ax.grid(True, which="major", linestyle=":", linewidth=0.3, alpha=0.5)
-            ax.set_facecolor("#ffffff")
-
-            scale_limits = self._determine_scale(label, segment)
-            ax.set_ylim(scale_limits)
-            scale_text = self._format_scale_text(scale_limits)
-            ax.text(
-                0.995,
-                0.9,
-                scale_text,
-                transform=ax.transAxes,
-                ha="right",
-                va="top",
-                fontsize=8,
-                bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="0.8", alpha=0.9),
-            )
-
-        if axes_list:
-            axes_list[-1].set_xlabel("Time (s)")
-            self.figure.align_ylabels(axes_list)
-        self.canvas.draw_idle()
+    def _clear_channel_plots(self) -> None:
+        for plot in self.channel_plots.values():
+            self.paned.forget(plot.frame)
+            plot.destroy()
+        self.channel_plots.clear()
 
     def _estimate_initial_scale(self, label: str) -> float:
         try:
@@ -344,7 +593,8 @@ class EDFViewer(tk.Tk):
         if segment.size == 0:
             return (-1.0, 1.0)
 
-        if self.autoscale.get():
+        use_auto = self.channel_autoscale_override.get(label, self.autoscale.get())
+        if use_auto:
             max_val = np.max(np.abs(segment))
             if max_val == 0:
                 max_val = 1.0
@@ -364,11 +614,6 @@ class EDFViewer(tk.Tk):
         if peak < 1:
             return f"±{peak * 1_000:.1f}m"
         return f"±{peak:.1f}"
-
-    def _update_time_slider_limits(self, window_seconds: float) -> None:
-        max_start = max(0.0, self.edf_file.duration_seconds - window_seconds)
-        upper = max_start if max_start > 0 else self.edf_file.duration_seconds
-        self.time_scale.configure(from_=0.0, to=max(upper, 0.0))
 
     def _parse_window_preset(self, value: str) -> float:
         value = value.strip().lower()
@@ -403,20 +648,26 @@ class EDFViewer(tk.Tk):
         except (tk.TclError, ValueError):
             return 0.5
 
-    def _on_mouse_move(self, event: MouseEvent) -> None:
-        if event.inaxes not in self.active_axes:
-            self.hover_label.set("")
+    def adjust_manual_scale(self, label: str, factor: float) -> None:
+        if label not in self.channel_scales:
             return
+        value = max(1e-6, float(self.channel_scales[label].get()))
+        value *= factor
+        self.channel_scales[label].set(value)
+        self.channel_autoscale_override[label] = False
+        if self.channel_dialog is not None and tk.Toplevel.winfo_exists(self.channel_dialog):
+            self.channel_dialog.update_scale_state_for(label)
+        self._update_plot()
 
-        axis_index = self.active_axes.index(event.inaxes)
-        if axis_index >= len(self.selected_channels):
-            self.hover_label.set("")
-            return
+    def set_channel_autoscale(self, label: str, enabled: bool) -> None:
+        self.channel_autoscale_override[label] = enabled
+        if self.channel_dialog is not None and tk.Toplevel.winfo_exists(self.channel_dialog):
+            self.channel_dialog.update_scale_state_for(label)
+        self._update_plot()
 
-        label = self.selected_channels[axis_index]
-        x = event.xdata if event.xdata is not None else float("nan")
-        y = event.ydata if event.ydata is not None else float("nan")
-        self.hover_label.set(f"{label}: t={x:.3f}s, value={y:.3f}")
+    def update_hover(self, label: str, time_value: float, sample_value: float) -> None:
+        timestamp = _format_seconds_hms_ms(time_value)
+        self.hover_label.set(f"{label}: {timestamp} | {sample_value:.4f}")
 
 
 class ChannelOptionsDialog(tk.Toplevel):
@@ -453,7 +704,9 @@ class ChannelOptionsDialog(tk.Toplevel):
                 channels_frame,
                 textvariable=self.viewer.channel_scales[label],
                 width=10,
-                state="disabled" if self.viewer.autoscale.get() else "normal",
+                state="disabled"
+                if self.viewer.channel_autoscale_override.get(label, True)
+                else "normal",
                 justify="right",
             )
             scale_entry.grid(row=row, column=1, sticky="ew", padx=(8, 0))
@@ -476,7 +729,7 @@ class ChannelOptionsDialog(tk.Toplevel):
         )
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.update_scale_state(self.viewer.autoscale.get())
+        self.update_scale_state()
 
     def _apply(self) -> None:
         selected = [label for label, var in self.channel_vars.items() if var.get()]
@@ -488,10 +741,18 @@ class ChannelOptionsDialog(tk.Toplevel):
         self.viewer._update_plot()
         self._on_close()
 
-    def update_scale_state(self, autoscale: bool) -> None:
-        state = "disabled" if autoscale else "normal"
-        for entry in self.scale_entries.values():
-            entry.configure(state=state)
+    def update_scale_state(self) -> None:
+        for label, entry in self.scale_entries.items():
+            autoscale = self.viewer.channel_autoscale_override.get(
+                label, self.viewer.autoscale.get()
+            )
+            entry.configure(state="disabled" if autoscale else "normal")
+
+    def update_scale_state_for(self, label: str) -> None:
+        if label not in self.scale_entries:
+            return
+        autoscale = self.viewer.channel_autoscale_override.get(label, self.viewer.autoscale.get())
+        self.scale_entries[label].configure(state="disabled" if autoscale else "normal")
 
     def _on_close(self) -> None:
         if self.viewer.channel_dialog is self:
