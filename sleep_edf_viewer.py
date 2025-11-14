@@ -33,7 +33,7 @@ matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.backend_bases import MouseEvent
 from matplotlib.figure import Figure
-from matplotlib.ticker import FuncFormatter
+from matplotlib.ticker import AutoLocator, FuncFormatter
 
 
 def _format_seconds_hms(seconds: float) -> str:
@@ -260,33 +260,60 @@ class ChannelPlot:
         self.color = color
 
         self.frame = ttk.Frame(viewer.paned)
-        self.frame.columnconfigure(0, weight=1)
+        self.frame.columnconfigure(0, weight=0)
+        self.frame.columnconfigure(1, weight=1)
         self.frame.rowconfigure(0, weight=1)
 
+        self.control_frame = ttk.Frame(self.frame, padding=(0, 6, 6, 6))
+        self.control_frame.grid(row=0, column=0, sticky="nsw")
+        self.control_frame.columnconfigure(0, weight=1)
+
+        self.channel_label = ttk.Label(
+            self.control_frame,
+            text=label,
+            font=("TkDefaultFont", 10, "bold"),
+            anchor="center",
+            justify="center",
+        )
+        self.channel_label.grid(row=0, column=0, sticky="ew")
+
+        self.value_var = tk.StringVar(value="--")
+        self.value_label = ttk.Label(
+            self.control_frame,
+            textvariable=self.value_var,
+            width=10,
+            anchor="center",
+            padding=(2, 6),
+        )
+        self.value_label.grid(row=1, column=0, sticky="ew", pady=(4, 8))
+
+        button_frame = ttk.Frame(self.control_frame)
+        button_frame.grid(row=2, column=0, sticky="n")
+        ttk.Button(button_frame, text="+", width=3, command=self._scale_up).grid(row=0, column=0, pady=(0, 4))
+        ttk.Button(button_frame, text="Auto", width=5, command=self._autoscale).grid(row=1, column=0, pady=4)
+        ttk.Button(button_frame, text="-", width=3, command=self._scale_down).grid(row=2, column=0, pady=(4, 0))
+
+        self.scale_label = ttk.Label(self.control_frame, text="", anchor="center")
+        self.scale_label.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+
         self.figure = Figure(figsize=(7, 1.8))
+        self.figure.subplots_adjust(left=0.08, right=0.98, top=0.92, bottom=0.2)
         self.ax = self.figure.add_subplot(111)
         self.ax.set_facecolor("#ffffff")
         self.ax.grid(True, which="major", linestyle=":", linewidth=0.3, alpha=0.5)
         self.ax.xaxis.set_major_formatter(FuncFormatter(lambda val, _pos: _format_seconds_hms(val)))
-        self.ax.set_ylabel(label, rotation=0, labelpad=40, fontsize=9, va="center")
+        self.ax.set_ylabel("")
         self.line, = self.ax.plot([], [], color=color, linewidth=0.8)
         self.ax.axhline(0, color="0.6", linewidth=0.5, linestyle="--", alpha=0.7)
 
         self.canvas = FigureCanvasTkAgg(self.figure, master=self.frame)
         self.canvas.draw()
-        self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
-
-        controls = ttk.Frame(self.frame)
-        controls.grid(row=1, column=0, sticky="ew")
-        controls.columnconfigure(1, weight=1)
-
-        ttk.Button(controls, text="-", width=3, command=self._scale_down).grid(row=0, column=0, padx=(0, 4))
-        self.scale_label = ttk.Label(controls, text="")
-        self.scale_label.grid(row=0, column=1, sticky="w")
-        ttk.Button(controls, text="Auto", width=5, command=self._autoscale).grid(row=0, column=2, padx=4)
-        ttk.Button(controls, text="+", width=3, command=self._scale_up).grid(row=0, column=3)
+        self.canvas.get_tk_widget().grid(row=0, column=1, sticky="nsew")
 
         self._hover_cid = self.canvas.mpl_connect("motion_notify_event", self._on_mouse_move)
+
+        self._time_axis = np.array([], dtype=float)
+        self._values = np.array([], dtype=float)
 
     # ------------------------------------------------------------------
     def destroy(self) -> None:
@@ -305,13 +332,18 @@ class ChannelPlot:
         window_seconds: float,
         show_xlabel: bool,
     ) -> None:
-        self.line.set_data(time_axis, values)
+        self._time_axis = np.asarray(time_axis, dtype=float)
+        self._values = np.asarray(values, dtype=float)
+        self.line.set_data(self._time_axis, self._values)
+        self._set_value_display(None)
         if time_axis.size:
-            self.ax.set_xlim(time_axis[0], time_axis[-1])
+            self.ax.set_xlim(self._time_axis[0], self._time_axis[-1])
         else:
             start = self.viewer.start_time.get()
             self.ax.set_xlim(start, start + window_seconds)
         self.ax.set_ylim(limits)
+        self.ax.yaxis.set_major_locator(AutoLocator())
+        self._update_y_ticks(limits)
         if show_xlabel:
             self.ax.set_xlabel("Time (HH:MM:SS)")
             self.ax.tick_params(axis="x", which="both", labelbottom=True)
@@ -335,10 +367,60 @@ class ChannelPlot:
         self.viewer.set_channel_autoscale(self.label, True)
 
     def _on_mouse_move(self, event: MouseEvent) -> None:
-        if event.xdata is None or event.ydata is None:
-            self.viewer.hover_label.set("")
+        if event.xdata is None or event.ydata is None or event.inaxes is None:
+            self._set_value_display(None)
+            self.viewer.clear_hover()
             return
-        self.viewer.update_hover(self.label, float(event.xdata), float(event.ydata))
+        time_value = float(event.xdata)
+        value = self._value_at_time(time_value)
+        self._set_value_display(value)
+        if value is None:
+            self.viewer.clear_hover()
+            return
+        self.viewer.update_hover(self.label, time_value, value)
+
+    def _set_value_display(self, value: float | None) -> None:
+        if value is None or not math.isfinite(value):
+            self.value_var.set("--")
+        else:
+            self.value_var.set(f"{value:.4f}")
+
+    def _value_at_time(self, time_value: float) -> float | None:
+        if self._time_axis.size == 0 or self._values.size == 0:
+            return None
+        idx = np.searchsorted(self._time_axis, time_value)
+        if idx <= 0:
+            nearest = 0
+        elif idx >= self._time_axis.size:
+            nearest = self._time_axis.size - 1
+        else:
+            prev_idx = idx - 1
+            if abs(self._time_axis[idx] - time_value) < abs(self._time_axis[prev_idx] - time_value):
+                nearest = idx
+            else:
+                nearest = prev_idx
+        if 0 <= nearest < self._values.size:
+            return float(self._values[nearest])
+        return None
+
+    def _update_y_ticks(self, limits: Tuple[float, float]) -> None:
+        renderer = self.canvas.get_renderer()
+        if renderer is None:
+            self.canvas.draw()
+            renderer = self.canvas.get_renderer()
+        if renderer is None:
+            return
+        axis_bbox = self.ax.get_window_extent(renderer=renderer)
+        height_px = axis_bbox.height
+        ticks = list(self.ax.get_yticks())
+        if not ticks:
+            return
+        approx_label_height = 14  # pixels
+        if len(ticks) > 1 and height_px <= approx_label_height * (len(ticks) + 0.5):
+            center = (limits[0] + limits[1]) / 2.0
+            self.ax.set_yticks([center])
+        else:
+            self.ax.set_yticks(ticks)
 
 class EDFViewer(tk.Tk):
     """Main application window for browsing EDF channels."""
@@ -450,7 +532,19 @@ class EDFViewer(tk.Tk):
         plot_frame.rowconfigure(0, weight=1)
         plot_frame.columnconfigure(0, weight=1)
 
-        self.paned = ttk.Panedwindow(plot_frame, orient=tk.VERTICAL)
+        self.paned = tk.PanedWindow(
+            plot_frame,
+            orient=tk.VERTICAL,
+            sashrelief=tk.SOLID,
+            sashwidth=12,
+            sashpad=4,
+            bg="#111111",
+            bd=0,
+            showhandle=True,
+            handlepad=18,
+            handlesize=30,
+            sashcursor="sb_v_double_arrow",
+        )
         self.paned.grid(row=0, column=0, sticky="nsew")
 
         nav_frame = ttk.Frame(plot_frame, padding=(0, 8, 0, 0))
@@ -562,12 +656,12 @@ class EDFViewer(tk.Tk):
                     self.channel_colors[label] = color
                 plot = ChannelPlot(self, label, color)
                 self.channel_plots[label] = plot
-                self.paned.add(plot.frame, weight=1)
+                self.paned.add(plot.frame, stretch="always")
                 self.channel_autoscale_override.setdefault(label, self.autoscale.get())
             else:
                 frame = self.channel_plots[label].frame
                 if str(frame) not in self.paned.panes():
-                    self.paned.add(frame, weight=1)
+                    self.paned.add(frame, stretch="always")
 
     def _clear_channel_plots(self) -> None:
         for plot in self.channel_plots.values():
@@ -668,6 +762,9 @@ class EDFViewer(tk.Tk):
     def update_hover(self, label: str, time_value: float, sample_value: float) -> None:
         timestamp = _format_seconds_hms_ms(time_value)
         self.hover_label.set(f"{label}: {timestamp} | {sample_value:.4f}")
+
+    def clear_hover(self) -> None:
+        self.hover_label.set("")
 
 
 class ChannelOptionsDialog(tk.Toplevel):
